@@ -185,3 +185,7 @@ cython_debug/
 *.pt
 *.pth
 *.h5
+
+real_robot/item_grasping/
+
+real_robot/processed_data/
