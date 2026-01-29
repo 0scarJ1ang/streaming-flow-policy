@@ -189,3 +189,5 @@ cython_debug/
 real_robot/item_grasping/
 
 real_robot/processed_data/
+
+experiment_results*/
