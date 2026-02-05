@@ -10,7 +10,7 @@ import json
 from typing import Union, Literal
 from torch import Tensor
 import sys
-# from robo_control import RoboControl # Assuming this is your local file
+from robo_control import RoboControl # Assuming this is your local file
 import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import Image
@@ -489,14 +489,7 @@ class RobotBrain:
 # SECTION 4: CONTROL NODE
 # ==============================================================================
 
-# Dummy class for execution context (replace with your actual import)
-class RoboControl:
-    def __init__(self):
-        self.ee_pose = [0]*8
-        self.ee_pose_queue = queue.Queue()
-        self.image_queue = queue.Queue()
-    def execute_rot(self, action):
-        pass # Placeholder
+
 
 if __name__ == "__main__":
     ee_pose_queue = queue.Queue()
@@ -544,7 +537,7 @@ if __name__ == "__main__":
                 print(f"[Execute] Step {brain.step_idx} (ChunkStep {brain.chunk_step_counter-1}): Action {action[:3]}")
                 brain.step_idx += 1
             
-            time.sleep(0.05) # 20Hz Control Loop
+            time.sleep(1/20) # 20Hz Control Loop
 
     except KeyboardInterrupt:
         print("[Control] Stopping...")
