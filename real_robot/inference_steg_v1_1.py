@@ -238,7 +238,7 @@ def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     return torch.stack((b1, b2, b3), dim=2)
 
 # ==============================================================================
-# SECTION 3: MAIN INFERENCE CLASS (With Streaming STEG)
+# SECTION 3: MAIN INFERENCE CLASS (Corrected Logic)
 # ==============================================================================
 
 class RobotBrain:
@@ -255,7 +255,7 @@ class RobotBrain:
         self.chunk_size = 8 
         
         # --- Standard Diffusion Params ---
-        self.sigma_infer = 0.0
+        self.sigma_infer = 0.0 # Deterministic ODE Mode
 
         # --- STEG Guidance Params ---
         self.steg_guidance_scale = 15.0
@@ -263,7 +263,7 @@ class RobotBrain:
         self.steg_n_ensemble = 16
         self.steg_k_horizon = 3
         self.obstacle_radius = 0.05
-        self.sigma_explore = 0.05
+        self.sigma_explore = 0.05 # Only for STEG internal simulation
 
         # --- Load Models (Same as before) ---
         print(f"[Brain] Loading checkpoint: {ckpt_path}")
@@ -295,11 +295,10 @@ class RobotBrain:
         self.dist_coeffs = np.zeros(5)
 
         # --- STREAMING STATE VARIABLES ---
-        # 这些是实现 "In-Context Guidance" 的关键
-        self.chunk_step_counter = 0     # 当前在 Chunk 的第几步 (0-7)
-        self.cached_global_cond = None  # 锁定的视觉观测 (Conditioning)
-        self.na = None                  # 当前的 Latent State
-        self.step_idx = 0               # 全局总步数 (Debug用)
+        self.chunk_step_counter = 0     
+        self.cached_global_cond = None  
+        self.na = None                  
+        self.step_idx = 0               
         self.static_obj_pos = None
 
     
@@ -312,6 +311,7 @@ class RobotBrain:
         gamma_dot = d_gamma_dt_si(t).view(-1, 1, 1).to(self.device)
         
         s_pred = -eta_pred / (gamma + EPS)
+        # Original logic: score_coeff is effectively 0 if sigma_infer is 0
         score_coeff = 0.5 * (self.sigma_infer ** 2) - (gamma * gamma_dot)
         return v_pred + score_coeff * s_pred
 
@@ -330,7 +330,6 @@ class RobotBrain:
             for k in range(self.steg_k_horizon):
                 t_input = torch.clamp(curr_t_sim, 1e-3, 0.99)
                 
-                # Predict drift for simulation
                 v_p = self.velocity_net(curr_na_sim, t_input, cond_ens)
                 eta_p = self.denoiser_net(curr_na_sim, t_input, cond_ens)
                 
@@ -338,27 +337,22 @@ class RobotBrain:
                 gamma_dot = d_gamma_dt_si(t_input).view(-1, 1, 1)
                 s_p = -eta_p / (gamma + 1e-6)
                 
-                # Simulation uses small fixed sigma for diversity
                 score_coeff = 0.5 * (0.05 ** 2) - (gamma * gamma_dot) 
                 b_drift_sim = v_p + score_coeff * s_p
                 
-                # --- Cost Calculation ---
-                # Unnormalize to physical space
+                # Cost Calculation
                 curr_na_sim_flat = curr_na_sim.squeeze(1) 
                 phys_vals = self.normalizer.unnormalize_diff_differentiable(curr_na_sim_flat, self.device)
                 sim_xyz = phys_vals[:, :3]
                 
-                # Distance Cost
                 dist_sq = ((sim_xyz - obstacle_pos_tensor) ** 2).sum(dim=-1)
-                
-                # Gaussian Repulsion Cost
                 cost_step = self.steg_guidance_scale * torch.exp(- dist_sq / (2 * self.obstacle_radius**2))
                 cum_cost = cum_cost + cost_step * self.dt_val
 
-                # Update State (Euler-Maruyama)
+                # Update State (SDE allowed in Simulation for diversity)
                 noise_step = torch.randn_like(curr_na_sim)
                 curr_na_sim = curr_na_sim + b_drift_sim * self.dt_val + \
-                              0.05 * math.sqrt(self.dt_val) * noise_step
+                              self.sigma_explore * math.sqrt(self.dt_val) * noise_step
                 curr_t_sim = curr_t_sim + self.dt_val
             
             # Backprop
@@ -397,15 +391,12 @@ class RobotBrain:
     def infer(self, ee_queue, image_queue, obstacle_pos=None):
         """
         Streaming Inference:
-        Call Once -> Compute One ODE Step -> Return One Action -> Keep Latent State
+        Call Once -> Decode Action -> Compute One ODE Step -> Update Latent State
         """
         
         # --- 1. Chunk Initialization (Step 0) ---
         if self.chunk_step_counter == 0:
-            # Wait for data if empty
             if ee_queue.empty(): return None
-            
-            # Drain queue to get latest
             current_ee_pose = None
             while not ee_queue.empty(): current_ee_pose = ee_queue.get()
             
@@ -414,7 +405,7 @@ class RobotBrain:
                 if image_queue.empty(): return None
                 if not self.calibrate_object(image_queue.get()): return None
 
-            # Construct Observation & Lock it (Cache Global Cond)
+            # Construct Obs
             raw_obs = np.concatenate([current_ee_pose, self.static_obj_pos]).astype(np.float32)
             raw_obs = raw_obs.reshape(1, -1)
             nobs = self.normalizer.normalize(raw_obs)
@@ -426,55 +417,44 @@ class RobotBrain:
             
             print(f"[Brain] Starting new chunk execution sequence (Step 0-7)")
 
-        # --- 2. Step-by-Step Generation ---
-        # obstacle_pos is fresh every call, allowing "Still inside chunk... based on guidance"
-        
+        # === FIX: DECODE ACTION FIRST (Before Integration) ===
+        # This ensures we execute the action corresponding to current time t, not t+dt
+        with torch.no_grad():
+            na_cpu = self.na.detach().cpu().numpy().squeeze()
+            action_min = self.normalizer.min[:10]
+            action_scale = self.normalizer.scale[:10]
+            raw_action = ((na_cpu + 1) / 2) * action_scale + action_min
+
+        # === COMPUTE NEXT STATE ===
         # Prepare Current Time t
         t_scalar = np.clip(self.chunk_step_counter * self.dt_val, 1e-3, 1.0 - 1e-3)
         t = torch.tensor([t_scalar], device=self.device, dtype=torch.float32)
 
-        # Handle Obstacle Logic
-        has_obstacle = False
-        obs_tensor = None
+        # Handle Obstacle Logic (STEG)
         steg_grad = torch.zeros_like(self.na)
         steg_scale_curr = 0.0
 
-        # Safe check for obstacle input
         if obstacle_pos is not None and len(obstacle_pos) == 3 and obstacle_pos[0] is not None:
-            has_obstacle = True
             obs_tensor = torch.tensor(obstacle_pos, device=self.device, dtype=torch.float32)
-            
             # Distance Check
             curr_phys = self.normalizer.unnormalize_diff_differentiable(self.na.squeeze(1), self.device)
             dist_to_obs = torch.norm(curr_phys[0, :3] - obs_tensor).item()
             
             if dist_to_obs < self.steg_activation_dist:
-                # Trigger STEG
                 steg_grad = self.compute_steg_gradient(self.na, t, self.cached_global_cond, obs_tensor)
                 severity = max(0, (1.0 - dist_to_obs / self.steg_activation_dist))
                 steg_scale_curr = self.steg_guidance_scale * severity
 
-        # --- 3. Integration Step (Model + Guidance) ---
+        # Integration Step (Model + Guidance)
         with torch.no_grad():
             # Base Drift
             b_drift_base = self.get_drift(self.na, t, self.cached_global_cond)
             
-            # Add Guidance
+            # Combine Drifts
             final_drift = b_drift_base + steg_scale_curr * steg_grad
             
-            # # Euler-Maruyama Integration
-            # noise = torch.randn_like(self.na)
-            # sigma_step = self.sigma_explore if has_obstacle else 0.0
-            
-            # Update Latent State (self.na is kept for next call)
-            self.na = self.na + final_drift * self.dt_val # + \
-                      # sigma_step * math.sqrt(self.dt_val) * noise
-
-            # Decode Action
-            na_cpu = self.na.detach().cpu().numpy().squeeze()
-            action_min = self.normalizer.min[:10]
-            action_scale = self.normalizer.scale[:10]
-            raw_action = ((na_cpu + 1) / 2) * action_scale + action_min
+            # Update Latent State for NEXT call (Deterministic ODE, no noise in execution)
+            self.na = self.na + final_drift * self.dt_val
 
         # --- 4. Counter Management ---
         self.chunk_step_counter += 1
@@ -488,8 +468,6 @@ class RobotBrain:
 # ==============================================================================
 # SECTION 4: CONTROL NODE
 # ==============================================================================
-
-
 
 if __name__ == "__main__":
     ee_pose_queue = queue.Queue()
@@ -510,9 +488,7 @@ if __name__ == "__main__":
     try:
         while not rospy.is_shutdown():
             # 1. Get Robot State
-            # (In real usage, this should come from control_node callbacks)
-            # mocking data for structure
-            current_pose = [0.32, 0.08, 0.41, 0, 0, 0, 1, 0] # x,y,z,qx,qy,qz,qw,g
+            current_pose = control_node.ee_pose
             x,y,z, qx,qy,qz,qw, g = current_pose
             p_mat = R.from_quat([qx, qy, qz, qw]).as_matrix()
             pose_6d = list(map(float, matrix_to_rotation_6d(torch.tensor(p_mat).unsqueeze(0))[0]))
@@ -527,7 +503,6 @@ if __name__ == "__main__":
             #     obstacle_data = [0.45, 0.0, 0.2]
 
             # 3. Inference
-            # The 'streaming' nature is handled internally by brain.chunk_step_counter
             action = brain.infer(control_node.ee_pose_queue, control_node.image_queue, obstacle_pos=obstacle_data)
 
             # 4. Execute
@@ -537,7 +512,7 @@ if __name__ == "__main__":
                 print(f"[Execute] Step {brain.step_idx} (ChunkStep {brain.chunk_step_counter-1}): Action {action[:3]}")
                 brain.step_idx += 1
             
-            time.sleep(1/20) # 20Hz Control Loop
+            time.sleep(0.05) # 20Hz Control Loop
 
     except KeyboardInterrupt:
         print("[Control] Stopping...")

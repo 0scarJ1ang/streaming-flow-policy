@@ -197,8 +197,12 @@ class MinMaxNormalizer:
         Returns:
             x_phys: Physical scale
         """
-        min_t = torch.tensor(self.min, device=device, dtype=torch.float32)
-        scale_t = torch.tensor(self.scale, device=device, dtype=torch.float32)
+        input_dim = x_norm_tensor.shape[-1]
+        current_min = self.min[:input_dim]
+        current_scale = self.scale[:input_dim]
+        min_t = torch.tensor(current_min, device=device, dtype=torch.float32)
+        scale_t = torch.tensor(current_scale, device=device, dtype=torch.float32)
+        
         return ((x_norm_tensor + 1) / 2) * scale_t + min_t
 
 # [FIX] Trick pickle to find MinMaxNormalizer in 'dataset' module
@@ -258,8 +262,8 @@ class RobotBrain:
         self.sigma_infer = 0.0
 
         # --- STEG Guidance Params ---
-        self.steg_guidance_scale = 15.0
-        self.steg_activation_dist = 0.3 
+        self.steg_guidance_scale = 1.0
+        self.steg_activation_dist = 10.4 
         self.steg_n_ensemble = 16
         self.steg_k_horizon = 3
         self.obstacle_radius = 0.05
@@ -442,17 +446,25 @@ class RobotBrain:
         # Safe check for obstacle input
         if obstacle_pos is not None and len(obstacle_pos) == 3 and obstacle_pos[0] is not None:
             has_obstacle = True
+            
             obs_tensor = torch.tensor(obstacle_pos, device=self.device, dtype=torch.float32)
             
             # Distance Check
             curr_phys = self.normalizer.unnormalize_diff_differentiable(self.na.squeeze(1), self.device)
             dist_to_obs = torch.norm(curr_phys[0, :3] - obs_tensor).item()
             
+            warning_distance = 0.4
             if dist_to_obs < self.steg_activation_dist:
                 # Trigger STEG
+                
                 steg_grad = self.compute_steg_gradient(self.na, t, self.cached_global_cond, obs_tensor)
-                severity = max(0, (1.0 - dist_to_obs / self.steg_activation_dist))
+                severity = max(0, (1.0 - dist_to_obs / warning_distance))
                 steg_scale_curr = self.steg_guidance_scale * severity
+                # print(steg_grad[0][0][:3])
+                print(f"STEG activated at {dist_to_obs} with severity {severity}")
+        else:
+            # print("No obstacle found!")
+            pass
 
         # --- 3. Integration Step (Model + Guidance) ---
         with torch.no_grad():
@@ -462,6 +474,9 @@ class RobotBrain:
             # Add Guidance
             final_drift = b_drift_base + steg_scale_curr * steg_grad
             
+            
+            # print(np.linalg.norm(steg_grad.cpu()[:3]))
+            
             # # Euler-Maruyama Integration
             # noise = torch.randn_like(self.na)
             # sigma_step = self.sigma_explore if has_obstacle else 0.0
@@ -469,7 +484,7 @@ class RobotBrain:
             # Update Latent State (self.na is kept for next call)
             self.na = self.na + final_drift * self.dt_val # + \
                       # sigma_step * math.sqrt(self.dt_val) * noise
-
+            # print(self.na[0][0][:3], control_node.ee_pose[:3])
             # Decode Action
             na_cpu = self.na.detach().cpu().numpy().squeeze()
             action_min = self.normalizer.min[:10]
@@ -496,6 +511,7 @@ if __name__ == "__main__":
     image_queue = queue.Queue()
     
     brain = RobotBrain(ckpt_path="models/real_robot_final.ckpt")
+    logger = open("debug.txt", 'w')
     
     print("[Control] Starting Loop...")
     rospy.init_node("inference_node")
@@ -505,14 +521,18 @@ if __name__ == "__main__":
     # Move to initial pose
     starting_pose = [0.320236, 0.078831, 0.416621, 0.950743, -0.298455, 0.083734, -0.289216, -0.951283, -0.106830, 3]
     control_node.execute_rot(starting_pose)
+    control_node.open_gripper()
+    last_action = None
     time.sleep(5)
-
+    # exit()
     try:
         while not rospy.is_shutdown():
             # 1. Get Robot State
             # (In real usage, this should come from control_node callbacks)
             # mocking data for structure
-            current_pose = [0.32, 0.08, 0.41, 0, 0, 0, 1, 0] # x,y,z,qx,qy,qz,qw,g
+            # current_pose = [0.32, 0.08, 0.41, 0, 0, 0, 1, 0] # x,y,z,qx,qy,qz,qw,g
+            # continue
+            current_pose = control_node.ee_pose
             x,y,z, qx,qy,qz,qw, g = current_pose
             p_mat = R.from_quat([qx, qy, qz, qw]).as_matrix()
             pose_6d = list(map(float, matrix_to_rotation_6d(torch.tensor(p_mat).unsqueeze(0))[0]))
@@ -521,23 +541,36 @@ if __name__ == "__main__":
 
             # 2. Get Obstacle Info
             # Simulate receiving data from perception node
-            obstacle_data = [None]
+            obstacle_data = control_node.obj_pos[0] ## assume 1 obstacle for now at ID 0
             # Example: Force an obstacle if step > 50
             # if brain.step_idx > 50:
             #     obstacle_data = [0.45, 0.0, 0.2]
 
             # 3. Inference
             # The 'streaming' nature is handled internally by brain.chunk_step_counter
-            action = brain.infer(control_node.ee_pose_queue, control_node.image_queue, obstacle_pos=obstacle_data)
-
+            ee_queue_open = queue.Queue()
+            if last_action is None:
+                action = brain.infer(control_node.ee_pose_queue, control_node.image_queue, obstacle_pos=obstacle_data)
+            else:
+                ee_queue_open.put(last_action) 
+                action = brain.infer(ee_queue_open, control_node.image_queue, obstacle_pos=obstacle_data)
+            control_node.target_obj_pose = brain.static_obj_pos
             # 4. Execute
             if action is not None:
+                print(action[:3], np.array(control_node.ee_pose[:3]))
+                ### debug: save the action + the current joint state (should be very similar to prev step!)
+                if last_action is not None:
+                    distance_between_frame = np.linalg.norm(np.array(action[:3]) - np.array(last_action[:3]), 1)
+                    # print(distance_between_frame)
+                    distance_to_obj = np.linalg.norm(np.array(control_node.ee_pose[:3]) - np.array(last_action[:3]), 1)
+                    # print(distance_to_obj)
+                    logger.write(f"{distance_to_obj}\n")
+                last_action = action
                 action = list(map(float, action))
                 control_node.execute_rot(action)
-                print(f"[Execute] Step {brain.step_idx} (ChunkStep {brain.chunk_step_counter-1}): Action {action[:3]}")
+                # print(f"[Execute] Step {brain.step_idx} (ChunkStep {brain.chunk_step_counter-1}): Action {action[:3]}")
                 brain.step_idx += 1
-            
-            time.sleep(1/20) # 20Hz Control Loop
+            time.sleep(1/30) # 20Hz Control Loop
 
     except KeyboardInterrupt:
         print("[Control] Stopping...")
