@@ -8,14 +8,14 @@ import os
 import math
 from typing import Union, Literal
 from torch import Tensor
-from diffusers.optimization import get_scheduler # 需要安装 diffusers: pip install diffusers
+from diffusers.optimization import get_scheduler
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 # 引入我们写好的 Dataset
-from dataset import RealRobotDataset
+from dataset_dp import RealRobotDataset
 
 # =========================================================
 # 0. 辅助类与函数 (EMA, Model, Math)
-#    (保留你提供的模型定义，为了完整性我把它放在这里)
 # =========================================================
 
 class EMAModel:
@@ -27,7 +27,6 @@ class EMAModel:
     def step(self, parameters):
         for s, p in zip(self.shadow, parameters):
             if p.requires_grad:
-                # 简单的指数滑动平均
                 s.data.mul_(self.power).add_(p.data, alpha=1 - self.power)
 
     def copy_to(self, parameters):
@@ -36,7 +35,7 @@ class EMAModel:
                 p.data.copy_(s.data)
 
 class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim, scale = 1):
+    def __init__(self, dim, scale=1):
         super().__init__()
         self.dim = dim
         self.scale = scale 
@@ -113,20 +112,20 @@ class ConditionalResidualBlock1D(nn.Module):
         out = self.blocks[0](x)
         embed = self.cond_encoder(cond)
         embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
-        scale, bias = embed[:,0,...], embed[:,1,...]
+        scale, bias = embed[:, 0, ...], embed[:, 1, ...]
         out = scale * out + bias
         out = self.blocks[1](out)
         out = out + self.residual_conv(x)
         return out
 
 class ConditionalUnet1D(nn.Module):
-    def __init__(self, input_dim, global_cond_dim, updownsample_type: Literal['Conv', 'Linear'], sin_embedding_scale, diffusion_step_embed_dim=256, down_dims=[256,512,1024], kernel_size=5, n_groups=8):
+    def __init__(self, input_dim, global_cond_dim, updownsample_type: Literal['Conv', 'Linear'], sin_embedding_scale, diffusion_step_embed_dim=256, down_dims=[256, 512, 1024], kernel_size=5, n_groups=8):
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
         start_dim = down_dims[0]
         dsed = diffusion_step_embed_dim
         diffusion_step_encoder = nn.Sequential(
-            SinusoidalPosEmb(dsed, scale = sin_embedding_scale),
+            SinusoidalPosEmb(dsed, scale=sin_embedding_scale),
             nn.Linear(dsed, dsed * 4), nn.Mish(), nn.Linear(dsed * 4, dsed),
         )
         cond_dim = dsed + global_cond_dim
@@ -155,7 +154,7 @@ class ConditionalUnet1D(nn.Module):
             if updownsample_type == 'Linear': upsample_layer = LinearUpsample1d(dim_in) if not is_last else nn.Identity()
             elif updownsample_type == 'Conv': upsample_layer = ConvUpsample1d(dim_in) if not is_last else nn.Identity()
             up_modules.append(nn.ModuleList([
-                ConditionalResidualBlock1D(dim_out*2, dim_in, cond_dim=cond_dim, kernel_size=kernel_size, n_groups=n_groups),
+                ConditionalResidualBlock1D(dim_out * 2, dim_in, cond_dim=cond_dim, kernel_size=kernel_size, n_groups=n_groups),
                 ConditionalResidualBlock1D(dim_in, dim_in, cond_dim=cond_dim, kernel_size=kernel_size, n_groups=n_groups),
                 upsample_layer,
             ]))
@@ -171,7 +170,7 @@ class ConditionalUnet1D(nn.Module):
         self.final_conv = final_conv
 
     def forward(self, sample: Tensor, timestep: Union[Tensor, float, int], global_cond=None) -> Tensor:
-        sample = sample.moveaxis(-1,-2)
+        sample = sample.moveaxis(-1, -2)
         timesteps = timestep
         if not torch.is_tensor(timesteps): timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0: timesteps = timesteps[None].to(sample.device)
@@ -192,206 +191,132 @@ class ConditionalUnet1D(nn.Module):
             x = resnet2(x, global_feature)
             x = upsample(x)
         x = self.final_conv(x)
-        x = x.moveaxis(-1,-2)
+        x = x.moveaxis(-1, -2)
         return x
 
 # =========================================================
-# 1. 核心数学函数 (SFP / SI)
-# =========================================================
-EPS = 1e-6
-
-def gamma_t_si(t):
-    # SI 气泡控制
-    return 0.1 * torch.sqrt(t * (1.0 - t) + EPS)
-
-def LinearlyInterpolateTrajectory(ξ, t):
-    B, T, A = ξ.shape
-    scaled_t = t * (T - 1)
-    l = scaled_t.floor().long().clamp(0, T - 2)
-    u = (l + 1).clamp(0, T - 1)
-    λ = scaled_t - l.float()
-    batch_idx = torch.arange(B, device=ξ.device)
-    ξl = ξ[batch_idx, l, :]
-    ξu = ξ[batch_idx, u, :]
-    λ = λ.unsqueeze(-1)
-    ξt = ξl + λ * (ξu - ξl)
-    dξdt = (ξu - ξl) * (T - 1)
-    return ξt, dξdt
-
-# =========================================================
-# 2. 训练主流程
+# 2. 训练主流程 (Diffusion Policy)
 # =========================================================
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # --- A. 参数配置 (适配 Real Robot) ---
+    # --- A. 参数配置 ---
     pred_horizon = 16
+    obs_horizon = 2
     
-    # 【修改点】 真实机器人维度
-    action_dim = 8  # 7 (pose) + 1 (gripper)
-    obs_dim = 11    # 8 (robot) + 3 (obj)
-    obs_horizon = 1 # 我们的 Dataset 目前只返回当前这一帧
+    action_dim = 10  # 最终动作维度: 3(pos) + 6(rot) + 1(gripper)
+    obs_dim = 13     # 最终观测维度: 3(pos) + 6(rot) + 1(gripper) + 3(obj)
     
-    num_epochs_si = 800
-    batch_size = 64 # 根据显存调整
+    num_epochs = 1000
+    batch_size = 64
 
     # --- B. 数据加载 ---
+    print("Loading dataset from processed_6Ddata...")
     dataset = RealRobotDataset(
-        dataset_dir="processed_data", 
+        dataset_dir="processed_6Ddata", # 指向你截图里的统一文件夹
         pred_horizon=pred_horizon,
         obs_horizon=obs_horizon
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    print(f"Dataset size: {len(dataset)}")
+    print(f"Total dataset size: {len(dataset)}")
+
+    # 获取原生的 13D/10D normalizer (已经由 Dataset 自动计算好)
+    normalizer = dataset.get_normalizer()
 
     # --- C. 初始化模型 ---
-    # Velocity Network (确定性场)
-    si_velocity_net = ConditionalUnet1D(
+    dp_noise_pred_net = ConditionalUnet1D(
         input_dim=action_dim,
         global_cond_dim=obs_dim * obs_horizon,
-        updownsample_type='Linear',
-        sin_embedding_scale=100,
+        updownsample_type='Conv',
+        sin_embedding_scale=1,
     ).to(device)
 
-    # Denoiser Network (随机噪声场)
-    si_denoiser_net = ConditionalUnet1D(
-        input_dim=action_dim,
-        global_cond_dim=obs_dim * obs_horizon,
-        updownsample_type='Linear',
-        sin_embedding_scale=100,
-    ).to(device)
+    print("Diffusion Model initialized successfully!")
 
-    print("Models initialized for Streaming SI Policy (Real Robot).")
-
-    # --- D. 优化器 ---
-    optimizer_si = torch.optim.AdamW([
-        {'params': si_velocity_net.parameters()},
-        {'params': si_denoiser_net.parameters()}
-    ], lr=1e-4, weight_decay=1e-6)
-
-    # EMA
-    ema_si_v = EMAModel(parameters=si_velocity_net.parameters(), power=0.75)
-    ema_si_eta = EMAModel(parameters=si_denoiser_net.parameters(), power=0.75)
-
-    lr_scheduler_si = get_scheduler(
-        name='cosine',
-        optimizer=optimizer_si,
-        num_warmup_steps=500,
-        num_training_steps=len(dataloader) * num_epochs_si
+    # --- D. 优化器、调度器与 EMA ---
+    num_diffusion_iters = 100
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_diffusion_iters,
+        beta_schedule='squaredcos_cap_v2',
+        clip_sample=True,
+        prediction_type='epsilon'
     )
 
-    # SFP 超参数
-    sigma0 = 0.4
-    k = 10.0
+    ema_dp = EMAModel(parameters=dp_noise_pred_net.parameters(), power=0.75)
 
-    # 创建保存目录
+    optimizer = torch.optim.AdamW(
+        params=dp_noise_pred_net.parameters(),
+        lr=1e-4, weight_decay=1e-6
+    )
+
+    lr_scheduler = get_scheduler(
+        name='cosine',
+        optimizer=optimizer,
+        num_warmup_steps=500,
+        num_training_steps=len(dataloader) * num_epochs
+    )
+
     os.makedirs("models", exist_ok=True)
-
     print("Starting training...")
 
     # --- E. 训练循环 ---
-    for epoch_idx in range(num_epochs_si):
-        epoch_loss = []
-        epoch_v_loss = []
-        epoch_eta_loss = []
-        
-        # 进度条
-        pbar = tqdm(dataloader, desc=f'Epoch {epoch_idx+1}/{num_epochs_si}', leave=False)
-        
-        for nbatch in pbar:
-            # 1. 获取数据 (已经归一化到 -1~1)
-            # nobs: [B, 11]
-            nobs = nbatch['obs'].to(device)
-            # naction: [B, 16, 8]
-            naction = nbatch['action'].to(device)
+    with tqdm(range(num_epochs), desc='Epoch') as tglobal:
+        for epoch_idx in tglobal:
+            epoch_loss = list()
             
-            # 【修改点】 动作处理
-            # 我们的 Dataset 已经对齐好了，naction 就是未来的轨迹
-            # ξ (xi) 是 Ground Truth Trajectory
-            ξ = naction 
-            B = ξ.shape[0]
-            
-            # 随机采样时间 t ~ U[0, 1]
-            t = torch.rand(B, device=device)
-            
-            # 2. 计算 GT 位置和速度 (Linear Interpolation)
-            ξt, dξdt = LinearlyInterpolateTrajectory(ξ, t)
-            
-            # 3. 构建 Flow Matching (FP) 基础目标
-            t_expanded = t.view(B, 1)
-            sigma_t_fp = sigma0 * torch.exp(-k * t_expanded)
-            noise_fp = torch.randn_like(ξt)
-            a_t_fp = ξt + sigma_t_fp * noise_fp
-            
-            # Velocity Target
-            v_target = dξdt - k * (a_t_fp - ξt)
-            
-            # 4. 构建 SI 扰动 (气泡)
-            gamma = gamma_t_si(t_expanded)
-            z_noise_si = torch.randn_like(ξt)
-            x_t_in_s = a_t_fp + gamma * z_noise_si
-            
-            # 5. 网络前向传播
-            # Reshape input: (B, 1, 8) 
-            net_input = x_t_in_s.unsqueeze(1)
-            # Flatten obs: (B, 11)
-            global_cond = nobs.flatten(start_dim=1)
-            
-            # 预测 v
-            v_pred = si_velocity_net(sample=net_input, timestep=t, global_cond=global_cond)
-            v_pred = v_pred.squeeze(1)
-            
-            # 预测 eta (noise)
-            eta_pred = si_denoiser_net(sample=net_input, timestep=t, global_cond=global_cond)
-            eta_pred = eta_pred.squeeze(1)
-            
-            # 6. Loss
-            loss_v = nn.functional.mse_loss(v_pred, v_target)
-            loss_eta = nn.functional.mse_loss(eta_pred, z_noise_si)
-            
-            loss = loss_v + loss_eta
-            
-            # 7. Backward
-            loss.backward()
-            optimizer_si.step()
-            optimizer_si.zero_grad()
-            lr_scheduler_si.step()
-            
-            # Update EMA
-            ema_si_v.step(si_velocity_net.parameters())
-            ema_si_eta.step(si_denoiser_net.parameters())
-            
-            # Logging
-            epoch_loss.append(loss.item())
-            epoch_v_loss.append(loss_v.item())
-            epoch_eta_loss.append(loss_eta.item())
-            
-            pbar.set_postfix(loss=loss.item(), v_loss=loss_v.item(), s_loss=loss_eta.item())
+            with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
+                for nbatch in tepoch:
+                    # 1. 取出已经归一化好的 13D obs 和 10D action
+                    obs = nbatch['obs'].to(device)         # (B, To, 13)
+                    naction = nbatch['action'].to(device)  # (B, Tp, 10)
+                    B = obs.shape[0]
 
-        # 每个 Epoch 结束打印信息
-        avg_loss = np.mean(epoch_loss)
-        print(f"Epoch {epoch_idx+1} | Loss: {avg_loss:.6f}")
+                    # Observation as FiLM conditioning
+                    obs_cond = obs.flatten(start_dim=1)  # (B, To * 13)
 
-        # 定期保存 Checkpoint
-        if (epoch_idx + 1) % 100 == 0:
-            ckpt_path_epoch = f"models/real_robot_epoch_{epoch_idx+1}.ckpt"
-            torch.save({
-                'velocity_net': si_velocity_net.state_dict(),
-                'denoiser_net': si_denoiser_net.state_dict(),
-                'normalizer': dataset.get_normalizer(), # 【重要】保存归一化参数，推理要用！
-            }, ckpt_path_epoch)
-            print(f" Saved checkpoint to {ckpt_path_epoch}")
+                    # 2. 采样噪声与 Timesteps
+                    noise = torch.randn(naction.shape, device=device)  # (B, Tp, 10)
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps,
+                        (B,), device=device
+                    ).long()
 
-    # 保存最终模型
-    ckpt_path_final = "models/real_robot_final.ckpt"
-    torch.save({
-        'velocity_net': si_velocity_net.state_dict(),
-        'denoiser_net': si_denoiser_net.state_dict(),
-        'normalizer': dataset.get_normalizer(),
-    }, ckpt_path_final)
-    print("Training Finished!")
+                    # 3. 前向扩散过程：给 Action 加噪
+                    noisy_actions = noise_scheduler.add_noise(naction, noise, timesteps)
+
+                    # 4. 预测噪声
+                    noise_pred = dp_noise_pred_net(noisy_actions, timesteps, global_cond=obs_cond)
+
+                    # 5. 计算损失与反向传播
+                    loss = nn.functional.mse_loss(noise_pred, noise)
+                    
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
+
+                    # 6. 更新 EMA
+                    ema_dp.step(dp_noise_pred_net.parameters())
+
+                    # Logging
+                    loss_cpu = loss.item()
+                    epoch_loss.append(loss_cpu)
+                    tepoch.set_postfix(loss=loss_cpu)
+                    
+            tglobal.set_postfix(loss=np.mean(epoch_loss))
+
+            # 保存 Checkpoint
+            if (epoch_idx + 1) % 200 == 0:
+                ckpt_path = f"models/dp_policy_epoch_{epoch_idx+1}.ckpt"
+                torch.save({
+                    'model_state_dict': dp_noise_pred_net.state_dict(),
+                    'ema_state_dict': [p.data for p in ema_dp.shadow],
+                    'normalizer': normalizer, # 记录原生的 13D/10D Normalizer，部署时直接用！
+                }, ckpt_path)
+
+    print("Training Completed.")
 
 if __name__ == "__main__":
     train()

@@ -190,4 +190,8 @@ real_robot/item_grasping/
 
 real_robot/processed_data/
 
+real_robot/processed_data_2/
+
 experiment_results*/
+
+real_robot/datasets/
